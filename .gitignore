@@ -1,0 +1,61 @@
+# Credentials & secrets
+credentials/
+openclaw.json
+
+# Agent runtime data (sessions, auth - no user code here)
+agents/
+
+# Runtime state
+runs/
+memory/
+exec-approvals.json
+update-check.json
+**/workspace-state.json
+**/auth-profiles.json
+
+# Agent memory & logs
+workspace/memory/
+workspace-*/memory/
+workspace/.openclaw/
+workspace-*/.openclaw/
+
+# Bridge artifacts — only the finalized python runner + protocol doc are shipped
+workspace/bridge-inbox/
+workspace/bridge-runner.sh
+workspace/bridge-test-request.json
+workspace/MAIN_HANDOFF_HANDLER.md
+workspace/CDP_PUBLISH_PLAN.md
+workspace/douyin-publisher-plan.md
+workspace/PENDING_DOUYIN_PAYLOAD_TEMPLATE.json
+
+# Git internals inside workspaces
+workspace/.git/
+workspace-*/.git/
+
+# OS junk
+.DS_Store
+*Zone.Identifier
+
+# Node modules
+node_modules/
+openclaw-plugins/**/node_modules/
+openclaw-plugins/**/dist/
+
+# Runtime & framework data (not user code)
+browser/
+logs/
+canvas/
+completions/
+identity/
+media/
+subagents/
+telegram/
+delivery-queue/
+devices/
+
+# Cron runtime
+cron/runs/
+cron/jobs.json.bak
+
+# Config backups (contain sensitive data)
+openclaw.json.bak*

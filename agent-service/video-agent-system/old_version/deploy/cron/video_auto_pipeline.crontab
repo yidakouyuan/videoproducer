@@ -1,0 +1,24 @@
+# Douyin auto pipeline cron config
+# Install:
+#   crontab /home/xinyue/workspace/video-agent-system/deploy/cron/video_auto_pipeline.crontab
+#
+# Verify:
+#   crontab -l
+#
+# Logs:
+#   /home/xinyue/workspace/video-agent-system/data/logs/auto_pipeline_runner/
+#   /home/xinyue/workspace/video-agent-system/data/logs/auto_pipeline/
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/disk2/xinyue/envs/video/bin
+
+# Optional runtime tuning (uncomment and adjust):
+# HOME_ROUNDS=5
+# HOME_VIDEOS_PER_ROUND=20
+# ENRICH_LIMIT=100
+# HOME_INCLUDE_RELATED=0
+# ENRICH_FORCE=0
+# REQUIRE_PLAY=0
+
+# Every 30 minutes
+*/30 * * * * /home/xinyue/workspace/video-agent-system/scripts/run_auto_pipeline_cron.sh

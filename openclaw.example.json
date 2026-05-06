@@ -1,0 +1,322 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.3.13"
+  },
+  "browser": {
+    "defaultProfile": "openclaw"
+  },
+  "auth": {
+    "profiles": {
+      "openai-codex:default": {
+        "provider": "openai-codex",
+        "mode": "oauth"
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openai-codex/gpt-5.4"
+      },
+      "workspace": "/home/YOUR_USER/.openclaw/workspace",
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "maxConcurrent": 4,
+      "subagents": {
+        "maxConcurrent": 8,
+        "maxSpawnDepth": 2,
+        "maxChildrenPerAgent": 5,
+        "runTimeoutSeconds": 900
+      },
+      "sandbox": {
+        "mode": "off"
+      }
+    },
+    "list": [
+      {
+        "id": "main"
+      },
+      {
+        "id": "orchestrator",
+        "name": "orchestrator",
+        "workspace": "/home/YOUR_USER/.openclaw/workspace-orchestrator",
+        "agentDir": "/home/YOUR_USER/.openclaw/agents/orchestrator/agent",
+        "subagents": {
+          "allowAgents": [
+            "tag-matcher",
+            "research-supervisor",
+            "writer",
+            "video-generate",
+            "publisher"
+          ]
+        },
+        "tools": {
+          "allow": [
+            "group:fs",
+            "message",
+            "group:runtime",
+            "group:sessions",
+            "browser"
+          ]
+        }
+      },
+      {
+        "id": "tag-matcher",
+        "name": "tag-matcher",
+        "workspace": "/home/YOUR_USER/.openclaw/workspace-tag-matcher",
+        "agentDir": "/home/YOUR_USER/.openclaw/agents/tag-matcher/agent",
+        "tools": {
+          "allow": [
+            "group:fs",
+            "tag_get_script_pack"
+          ]
+        }
+      },
+      {
+        "id": "research-supervisor",
+        "name": "research-supervisor",
+        "workspace": "/home/YOUR_USER/.openclaw/workspace-research-supervisor",
+        "agentDir": "/home/YOUR_USER/.openclaw/agents/research-supervisor/agent",
+        "subagents": {
+          "allowAgents": [
+            "douyin-search",
+            "web-search"
+          ]
+        },
+        "tools": {
+          "allow": [
+            "group:fs",
+            "group:sessions",
+            "media_resolve_video",
+            "media_fetch_video",
+            "media_delete",
+            "media_cleanup",
+            "video_analyze_start",
+            "video_analyze_result",
+            "video_analyze_delete",
+            "transcribe_start",
+            "transcribe_result",
+            "transcribe_delete",
+            "browser"
+          ]
+        }
+      },
+      {
+        "id": "douyin-search",
+        "name": "douyin-search",
+        "workspace": "/home/YOUR_USER/.openclaw/workspace-douyin-search",
+        "agentDir": "/home/YOUR_USER/.openclaw/agents/douyin-search/agent",
+        "tools": {
+          "allow": [
+            "group:fs",
+            "browser"
+          ]
+        }
+      },
+      {
+        "id": "web-search",
+        "name": "web-search",
+        "workspace": "/home/YOUR_USER/.openclaw/workspace-web-search",
+        "agentDir": "/home/YOUR_USER/.openclaw/agents/web-search/agent",
+        "tools": {
+          "allow": [
+            "group:fs",
+            "browser"
+          ]
+        }
+      },
+      {
+        "id": "writer",
+        "name": "writer",
+        "workspace": "/home/YOUR_USER/.openclaw/workspace-writer",
+        "agentDir": "/home/YOUR_USER/.openclaw/agents/writer/agent",
+        "tools": {
+          "allow": [
+            "group:fs"
+          ]
+        }
+      },
+      {
+        "id": "video-generate",
+        "name": "video-generate",
+        "workspace": "/home/YOUR_USER/.openclaw/workspace-video-generate",
+        "agentDir": "/home/YOUR_USER/.openclaw/agents/video-generate/agent",
+        "tools": {
+          "allow": [
+            "group:fs",
+            "video_generate_start",
+            "video_generate_result",
+            "video_generate_delete"
+          ]
+        }
+      },
+      {
+        "id": "publisher",
+        "name": "publisher",
+        "workspace": "/home/YOUR_USER/.openclaw/workspace-publisher",
+        "agentDir": "/home/YOUR_USER/.openclaw/agents/publisher/agent",
+        "tools": {
+          "allow": [
+            "group:fs",
+            "exec",
+            "browser"
+          ]
+        }
+      },
+      {
+        "id": "stats-collector",
+        "name": "stats-collector",
+        "workspace": "/home/YOUR_USER/.openclaw/workspace-stats-collector",
+        "agentDir": "/home/YOUR_USER/.openclaw/agents/stats-collector/agent",
+        "tools": {
+          "allow": [
+            "group:fs",
+            "stats_writer",
+            "browser"
+          ]
+        }
+      },
+      {
+        "id": "stats-analyzer",
+        "name": "stats-analyzer",
+        "workspace": "/home/YOUR_USER/.openclaw/workspace-stats-analyzer",
+        "agentDir": "/home/YOUR_USER/.openclaw/agents/stats-analyzer/agent",
+        "tools": {
+          "allow": [
+            "group:fs",
+            "exec",
+            "message",
+            "stats_query"
+          ]
+        }
+      }
+    ]
+  },
+  "tools": {
+    "sessions": {
+      "visibility": "all"
+    },
+    "agentToAgent": {
+      "enabled": true
+    },
+    "elevated": {
+      "enabled": true,
+      "allowFrom": {
+        "whatsapp": [
+          "+YOUR_WHATSAPP_NUMBER"
+        ],
+        "webchat": [
+          "openclaw-control-ui"
+        ]
+      }
+    },
+    "exec": {
+      "host": "node",
+      "security": "full",
+      "ask": "off",
+      "node": "Windows Node"
+    }
+  },
+  "bindings": [
+    {
+      "type": "route",
+      "agentId": "orchestrator",
+      "match": {
+        "channel": "telegram",
+        "accountId": "*"
+      }
+    }
+  ],
+  "messages": {
+    "ackReactionScope": "group-mentions"
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto",
+    "restart": true,
+    "ownerDisplay": "raw"
+  },
+  "cron": {
+    "enabled": true,
+    "store": "/home/YOUR_USER/.openclaw/cron/jobs.json",
+    "maxConcurrentRuns": 2,
+    "sessionRetention": "48h"
+  },
+  "hooks": {
+    "internal": {
+      "enabled": true,
+      "entries": {
+        "command-logger": {
+          "enabled": true
+        },
+        "session-memory": {
+          "enabled": true
+        }
+      }
+    }
+  },
+  "channels": {
+    "whatsapp": {
+      "enabled": true,
+      "dmPolicy": "allowlist",
+      "selfChatMode": true,
+      "allowFrom": [
+        "+YOUR_WHATSAPP_NUMBER"
+      ],
+      "groupPolicy": "allowlist",
+      "debounceMs": 0,
+      "mediaMaxMb": 50
+    },
+    "telegram": {
+      "enabled": true,
+      "dmPolicy": "allowlist",
+      "botToken": "YOUR_TELEGRAM_BOT_TOKEN",
+      "allowFrom": [
+        "tg:YOUR_TELEGRAM_USER_ID"
+      ],
+      "groupPolicy": "allowlist",
+      "streaming": "partial"
+    }
+  },
+  "gateway": {
+    "port": 18789,
+    "mode": "local",
+    "bind": "loopback",
+    "auth": {
+      "mode": "token",
+      "token": "YOUR_GATEWAY_AUTH_TOKEN"
+    },
+    "tailscale": {
+      "mode": "off",
+      "resetOnExit": false
+    },
+    "nodes": {
+      "browser": {
+        "mode": "auto",
+        "node": "Windows Node"
+      }
+    }
+  },
+  "plugins": {
+    "allow": [
+      "video-http-tools",
+      "whatsapp",
+      "telegram"
+    ],
+    "load": {
+      "paths": [
+        "/home/YOUR_USER/.openclaw/openclaw-plugins/video-http-tools"
+      ]
+    },
+    "entries": {
+      "video-http-tools": {
+        "enabled": true,
+        "config": {
+          "baseUrl": "http://127.0.0.1:8000",
+          "timeoutMs": 30000
+        }
+      }
+    }
+  }
+}

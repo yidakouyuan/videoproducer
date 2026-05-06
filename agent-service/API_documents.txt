@@ -1,0 +1,1042 @@
+# 数据类型
+
+## 2.1 通用基础枚举
+
+```python
+from dataclasses import dataclass, field
+from typing import Optional, Literal, Any, Dict, List
+
+Platform = Literal[
+    "douyin",
+    "xiaohongshu",
+    "weibo",
+    "bilibili",
+    "youtube",
+    "other",
+]
+
+SourceType = Literal[
+    "post",
+    "video",
+    "note",
+    "article",
+    "image_post",
+    "other",
+]
+
+MediaType = Literal[
+    "video",
+    "audio",
+    "image",
+    "text",
+    "other",
+]
+
+AnalysisType = Literal[
+    "video_understanding",
+    "transcription",
+    "image_understanding",
+    "ocr",
+    "music_identification",
+    "other",
+]
+
+JobStatus = Literal[
+    "queued",
+    "running",
+    "done",
+    "failed",
+    "partial",
+    "cancelled",
+]
+
+SourceQuality = Literal[
+    "high",
+    "medium",
+    "low",
+]
+
+```
+
+---
+
+## 2.2 用户任务相关
+
+### `CreativeBrief`
+
+系统内部统一任务描述。
+
+```python
+@dataclass
+class CreativeBrief:
+    user_query: str
+    theme: Optional[str] = None
+    audience: Optional[str] = None
+    duration_sec: Optional[int] = None
+    style: Optional[str] = None
+    lang: str = "zh"
+    publish_required: bool = False
+    constraints: Dict[str, Any] = field(default_factory=dict)
+    extra: Dict[str, Any] = field(default_factory=dict)
+```
+
+---
+
+### `InputMaterial`
+
+统一一条输入素材。
+
+```python
+@dataclass
+class InputMaterial:
+    material_type: MediaType | Literal["link"]
+    text: Optional[str] = None
+    source_ref: Optional["ContentRef"] = None
+    media_id: Optional[str] = None
+    url: Optional[str] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+```
+
+---
+
+### `InputMaterialSet`
+
+统一一组输入素材。
+
+```python
+@dataclass
+class InputMaterialSet:
+    materials: List[InputMaterial] = field(default_factory=list)
+```
+
+---
+
+## 2.3 平台内容引用相关
+
+### `ContentRef`
+
+通用“平台内容引用”。
+
+```python
+@dataclass
+class ContentRef:
+    platform: Platform
+    source_type: SourceType
+    source_id: str
+    source_url: str
+    author_id: Optional[str] = None
+    author_name: Optional[str] = None
+    title: Optional[str] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+```
+
+> 这个类是最重要的之一。
+> 
+> 
+> 以后无论抖音、小红书、微博，先统一落到它。
+> 
+
+---
+
+### `VideoCandidate`
+
+搜索阶段的候选视频对象。
+
+```python
+@dataclass
+class Stats:
+    digg: Optional[int] = None
+    collect: Optional[int] = None
+    comment: Optional[int] = None
+    share: Optional[int] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+    
+@dataclass
+class CoverImage:
+    url: str
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+@dataclass
+class AuthorInfo:
+    author_id: Optional[str] = None
+    author_name: Optional[str] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class VideoCandidate:
+    content_ref: ContentRef
+    title: str
+    stats: Stats = field(default_factory=Stats)
+    tags: List[str] = field(default_factory=list)
+    cover_image: Optional[CoverImage] = None
+    author: Optional[AuthorInfo] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+```
+
+---
+
+## 2.4 媒体解析与缓存相关
+
+### `ResolvedMediaRef`
+
+从平台内容解析出的正式媒体引用。
+
+```python
+@dataclass
+class ResolvedMediaRef:
+    content_ref: ContentRef
+    media_type: MediaType
+    media_url: Optional[str] = None
+    downloadable: bool = False
+    mime_type: Optional[str] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+```
+
+> 这层的意义是：
+> 
+> 
+> “这个内容已经被解析成媒体地址了，但还没被系统正式接管。”
+> 
+
+---
+
+### `StorageInfo`
+
+系统内部存储信息。
+
+```python
+@dataclass
+class StorageInfo:
+    local_path: Optional[str] = None
+    object_url: Optional[str] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+```
+
+---
+
+### `StoredMedia`
+
+系统已下载/缓存的稳定媒体对象。
+
+```python
+@dataclass
+class StoredMedia:
+    media_id: str
+    content_ref: ContentRef
+    media_type: MediaType
+    storage: StorageInfo
+    duration_sec: Optional[float] = None
+    mime_type: Optional[str] = None
+    file_size_bytes: Optional[int] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+```
+
+> 后续分析服务应该尽量只吃这个对象，或者至少吃它的 `media_id`。
+> 
+
+---
+
+## 2.5 分析结果相关
+
+### `ShotSegment`
+
+视频镜头段。
+
+```python
+@dataclass
+class ShotSegment:
+    start_sec: float
+    end_sec: float
+    shot_type: Optional[str] = None
+    visual: Optional[str] = None
+    text_overlay: Optional[str] = None
+    camera_motion: Optional[str] = None
+    transition_in: Optional[str] = None
+    transition_out: Optional[str] = None
+    notes: Optional[str] = None
+```
+
+---
+
+### `VideoBreakdown`
+
+视频制作拆解。
+
+```python
+@dataclass
+class VideoBreakdown:
+    structure: Dict[str, Any] = field(default_factory=dict)
+    editing_style: Dict[str, Any] = field(default_factory=dict)
+    shots: List[ShotSegment] = field(default_factory=list)
+    audio: Dict[str, Any] = field(default_factory=dict)
+    claims: List[Dict[str, Any]] = field(default_factory=list)
+```
+
+---
+
+### `TranscriptHighlight`
+
+转写高亮。
+
+```python
+@dataclass
+class TranscriptHighlight:
+    start_sec: float
+    end_sec: float
+    text: str
+```
+
+---
+
+### `TranscriptResult`
+
+转写结果。
+
+```python
+@dataclass
+class TranscriptResult:
+    transcript: str
+    highlights: List[TranscriptHighlight] = field(default_factory=list)
+    confidence: Optional[float] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+```
+
+---
+
+### `CompressedSummary`
+
+压缩摘要。
+
+```python
+@dataclass
+class CompressedSummary:
+    summary_text: str
+    key_points: List[str] = field(default_factory=list)
+    fit_score_hint: Optional[float] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+```
+
+---
+
+### `~~AnalysisResult~~`
+
+~~统一分析结果外壳。~~
+
+```python
+@dataclass
+class AnalysisResult:
+    analysis_id: str
+    target_media_id: str
+    analysis_type: AnalysisType
+    provider: str
+    status: JobStatus
+    result: Dict[str, Any] = field(default_factory=dict)
+    quality: Dict[str, Any] = field(default_factory=dict)
+    extra: Dict[str, Any] = field(default_factory=dict)
+```
+
+> ~~这个类是扩展性核心。~~
+> 
+> 
+> ~~以后视频理解、OCR、BGM 识别都能统一挂在这里。~~
+> 
+
+---
+
+## 2.6 证据相关
+
+### `WebEvidence`
+
+站外网页证据。
+
+```python
+@dataclass
+class WebEvidence:
+    evidence_id: str
+    title: str
+    url: str
+    snippet: Optional[str] = None
+    claim: Optional[str] = None
+    extracted_text: Optional[str] = None
+    summary: Optional[str] = None
+    published_at: Optional[str] = None
+    source_quality: Optional[SourceQuality] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+```
+
+---
+
+### `~~EvidenceItem~~`
+
+~~通用证据对象。~~
+
+```python
+@dataclass
+class EvidenceItem:
+    evidence_id: str
+    source_type: str
+    content_ref: Optional[ContentRef] = None
+    claim: Optional[str] = None
+    snippet: Optional[str] = None
+    confidence: Optional[float] = None
+    timestamp: Optional[str] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+```
+
+> ~~这个是扩展版最重要的统一抽象。~~
+> 
+> 
+> ~~MVP 里你可以先主要用 `WebEvidence` + 视频相关对象，~~
+> 
+> ~~以后再逐步收口到 `EvidenceItem`。~~
+> 
+
+---
+
+## 2.7 GraphRAG / Script Pack 相关
+
+### `TagCard`
+
+```python
+@dataclass
+class TagCard:
+    tag: str
+    summary_1_2_sentences: str
+```
+
+---
+
+### `CommunityReport`
+
+```python
+@dataclass
+class CommunityReport:
+    community_id: str
+    title: str
+    angles: List[str] = field(default_factory=list)
+    templates: List[str] = field(default_factory=list)
+    evidence_refs: List[Dict[str, Any]] = field(default_factory=list)
+```
+
+---
+
+### `EvidencePack`
+
+```python
+@dataclass
+class EvidencePack:
+    tag: str
+    top_titles: List[str] = field(default_factory=list)
+    stats_snapshot: Dict[str, Any] = field(default_factory=dict)
+    cooccur_topk: List[Dict[str, Any]] = field(default_factory=list)
+```
+
+---
+
+### `ScriptPack`
+
+```python
+@dataclass
+class ScriptPack:
+    canonical_topic: str
+    tag_card: Optional[TagCard] = None
+    community_reports: List[CommunityReport] = field(default_factory=list)
+    evidence_packs: List[EvidencePack] = field(default_factory=list)
+    search_seeds: Dict[str, List[str]] = field(default_factory=dict)
+```
+
+---
+
+## 2.8 最终收敛对象
+
+### `SelectedVideoEvidence`
+
+```python
+@dataclass
+class SelectedVideoEvidence:
+    media_id: str
+    content_ref: ContentRef
+    video_breakdown: Optional[VideoBreakdown] = None
+    transcript_result: Optional[TranscriptResult] = None
+    compressed_summary: Optional[CompressedSummary] = None
+    extra: Dict[str, Any] = field(default_factory=dict)
+```
+
+---
+
+### `EvidenceBundle`
+
+```python
+@dataclass
+class EvidenceBundle:
+    creative_brief: CreativeBrief
+    script_pack: ScriptPack
+    selected_videos: List[SelectedVideoEvidence] = field(default_factory=list)
+    selected_web_evidence: List[WebEvidence] = field(default_factory=list)
+    extra: Dict[str, Any] = field(default_factory=dict)
+```
+
+> 这是 Writer 的直接输入对象。
+> 
+
+---
+
+# 最终 HTTP API 清单（MVP）
+
+## 一、查询 / 生成类
+
+---
+
+## 1. `POST /tag/script_pack`
+
+### 用途
+
+根据 `tag` 查询离线 GraphRAG / Script Pack 结果，作为研究阶段的知识起点。
+
+### 输入
+
+```json
+{
+  "tag": "清迈旅行",
+  "top_k_communities": 3,
+  "top_k_cooccur": 20,
+  "lang": "zh",
+  "version": "latest"
+}
+```
+
+### 输出
+
+```json
+{
+  "ok": true,
+  "data": {
+    "tag": "清迈旅行",
+    "canonical_topic": "清迈旅行",
+    "tag_card": {
+      "tag": "清迈旅行",
+      "summary_1_2_sentences": "适合做路线清单、避坑、预算拆解类视频。"
+    },
+    "community_reports": [
+      {
+        "community_id": "L2-001",
+        "title": "清迈咖啡馆与拍照路线",
+        "angles": ["路线规划", "拍照点", "避坑"],
+        "templates": ["开场钩子→3点清单→结尾CTA"],
+        "evidence_refs": []
+      }
+    ],
+    "evidence_packs": [
+      {
+        "tag": "清迈咖啡馆",
+        "top_titles": ["清迈最美咖啡馆合集"],
+        "stats_snapshot": {
+          "post_count": 1234,
+          "hot_score": 0.81
+        },
+        "cooccur_topk": [
+          {
+            "tag": "清迈拍照",
+            "w_count": 42,
+            "w_recent": 7
+          }
+        ]
+      }
+    ],
+    "search_seeds": {
+      "douyin_queries": ["清迈 3天2夜 路线", "清迈 咖啡馆 拍照"],
+      "web_queries": ["清迈 旅行 攻略 避坑", "清迈 必去景点 2026"]
+    }
+  },
+  "meta": {
+    "request_id": "req_xxx",
+    "elapsed_ms": 45
+  }
+}
+```
+
+---
+
+## 2. `POST /media/resolve_video`
+
+### 用途
+
+根据平台内容引用（当前是抖音视频）解析出正式的 `video_url`，并判断是否可下载。
+
+### 输入
+
+```json
+{
+  "source_ref": {
+    "platform": "douyin",
+    "aweme_id": "7611467221630662638",
+    "share_url": "https://www.douyin.com/video/7611467221630662638"
+  }
+}
+```
+
+### 输出
+
+```json
+{
+  "ok": true,
+  "data": {
+    "platform": "douyin",
+    "aweme_id": "7611467221630662638",
+    "share_url": "https://www.douyin.com/video/7611467221630662638",
+    "video_url": "https://v3-dy-....mp4",
+    "downloadable": true
+  },
+  "meta": {
+    "request_id": "req_xxx",
+    "elapsed_ms": 320
+  }
+}
+```
+
+### 失败示例
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "NOT_FOUND",
+    "message": "unable to resolve downloadable video_url"
+  },
+  "meta": {
+    "request_id": "req_xxx"
+  }
+}
+```
+
+---
+
+## 3. `POST /media/fetch_video`
+
+### 用途
+
+下载并缓存已经解析成功的视频，生成系统内部可稳定使用的 `media_id`。
+
+### 输入
+
+```json
+{
+  "resolved_video_ref": {
+    "platform": "douyin",
+    "aweme_id": "7611467221630662638",
+    "share_url": "https://www.douyin.com/video/7611467221630662638",
+    "video_url": "https://v3-dy-....mp4",
+    "downloadable": true
+  }
+}
+```
+
+### 输出
+
+```json
+{
+  "ok": true,
+  "data": {
+    "media_id": "md_xxx",
+    "platform": "douyin",
+    "aweme_id": "7611467221630662638",
+    "share_url": "https://www.douyin.com/video/7611467221630662638",
+    "local_video_path": "/data/videos/md_xxx.mp4",
+    "object_url": "https://storage.example.com/videos/md_xxx.mp4",
+    "duration_sec": 38.2
+  },
+  "meta": {
+    "request_id": "req_xxx",
+    "elapsed_ms": 2150
+  }
+}
+```
+
+---
+
+## 4. `POST /video/analyze/start`
+
+### 用途
+
+启动视频分析任务（例如 Gemini 视频理解），异步返回 `job_id`。
+
+### 输入
+
+```json
+{
+  "media_id": "md_xxx",
+  "input_url": "https://storage.example.com/videos/md_xxx.mp4",
+  "analysis_profile": "travel",
+  "lang": "zh",
+  "output_schema_version": "v1"
+}
+```
+
+### 输出
+
+```json
+{
+  "ok": true,
+  "data": {
+    "job_id": "va_xxx",
+    "status": "queued"
+  },
+  "meta": {
+    "request_id": "req_xxx"
+  }
+}
+```
+
+---
+
+## 5. `GET /video/analyze/result/{job_id}`
+
+### 用途
+
+查询视频分析任务结果。
+
+### 输入
+
+路径参数：
+
+```
+/video/analyze/result/va_xxx
+```
+
+### 输出
+
+```json
+{
+  "ok": true,
+  "data": {
+    "job_id": "va_xxx",
+    "status": "done",
+    "source_quality": "high",
+    "analysis_confidence": 0.78,
+    "video_breakdown": {
+      "structure": {
+        "hook": "开场3秒强钩子",
+        "body": ["路线介绍", "避坑点"],
+        "cta": "结尾引导收藏"
+      },
+      "editing_style": {
+        "pace": "fast",
+        "cut_frequency": "high",
+        "transition_patterns": ["硬切", "推拉变焦"],
+        "caption_style": "大字标题+关键词高亮",
+        "effects": ["whoosh音效"]
+      },
+      "shots": [
+        {
+          "start_sec": 0.0,
+          "end_sec": 2.8,
+          "shot_type": "hook",
+          "visual": "航拍+快速蒙太奇",
+          "text_overlay": "清迈3天2夜这样玩",
+          "camera_motion": "zoom-in",
+          "transition_in": "cut",
+          "transition_out": "cut",
+          "notes": "节奏密集"
+        }
+      ],
+      "audio": {
+        "bgm_style": {
+          "mood": "upbeat",
+          "genre": "electronic",
+          "bpm_estimate": 118
+        },
+        "audio_mix": {
+          "music_dominant": true,
+          "voiceover": true,
+          "sfx": ["whoosh"]
+        }
+      },
+      "claims": [
+        {
+          "type": "template",
+          "text": "典型旅游清单类爆款模板"
+        }
+      ]
+    }
+  },
+  "meta": {
+    "request_id": "req_xxx",
+    "elapsed_ms": 51234
+  }
+}
+```
+
+---
+
+## 6. `POST /transcribe/start`
+
+### 用途
+
+启动转写任务，异步返回 `job_id`。
+
+### 输入
+
+```json
+{
+  "media_id": "md_xxx",
+  "provider": "openai",
+  "lang": "zh",
+  "mode": "highlights"
+}
+```
+
+### 输出
+
+```json
+{
+  "ok": true,
+  "data": {
+    "job_id": "tr_xxx",
+    "status": "queued"
+  },
+  "meta": {
+    "request_id": "req_xxx"
+  }
+}
+```
+
+---
+
+## 7. `GET /transcribe/result/{job_id}`
+
+### 用途
+
+查询转写任务结果。
+
+### 输入
+
+路径参数：
+
+```
+/transcribe/result/tr_xxx
+```
+
+### 输出
+
+```json
+{
+  "ok": true,
+  "data": {
+    "job_id": "tr_xxx",
+    "status": "done",
+    "transcript": "……",
+    "highlights": [
+      {
+        "start_sec": 12.3,
+        "end_sec": 16.8,
+        "text": "重点：清迈咖啡馆避坑"
+      }
+    ],
+    "confidence": 0.85
+  },
+  "meta": {
+    "request_id": "req_xxx",
+    "elapsed_ms": 31000
+  }
+}
+```
+
+---
+
+# 二、删除 / 清理类
+
+---
+
+## 8. `DELETE /media/{media_id}`
+
+### 用途
+
+删除某个已缓存的视频资源，释放磁盘和对象存储空间。
+
+### 输入
+
+路径参数：
+
+```
+DELETE /media/md_xxx
+```
+
+### 输出
+
+```json
+{
+  "ok": true,
+  "data": {
+    "media_id": "md_xxx",
+    "deleted": true,
+    "deleted_local_file": true,
+    "deleted_object_file": true
+  },
+  "meta": {
+    "request_id": "req_xxx"
+  }
+}
+```
+
+### 说明
+
+建议删除内容包括：
+
+- 本地缓存文件
+- 对象存储文件（如果有）
+- `StoredMedia` 记录
+
+---
+
+## 9. `DELETE /video/analyze/{job_id}`
+
+### 用途
+
+删除某个视频分析任务结果。
+
+### 输入
+
+路径参数：
+
+```
+DELETE /video/analyze/va_xxx
+```
+
+### 输出
+
+```json
+{
+  "ok": true,
+  "data": {
+    "job_id": "va_xxx",
+    "deleted": true
+  },
+  "meta": {
+    "request_id": "req_xxx"
+  }
+}
+```
+
+### 说明
+
+建议删除内容包括：
+
+- 分析任务记录
+- `video_breakdown`
+- 相关缓存 summary（如果单独存）
+
+---
+
+## 10. `DELETE /transcribe/{job_id}`
+
+### 用途
+
+删除某个转写任务结果。
+
+### 输入
+
+路径参数：
+
+```
+DELETE /transcribe/tr_xxx
+```
+
+### 输出
+
+```json
+{
+  "ok": true,
+  "data": {
+    "job_id": "tr_xxx",
+    "deleted": true
+  },
+  "meta": {
+    "request_id": "req_xxx"
+  }
+}
+```
+
+### 说明
+
+建议删除内容包括：
+
+- transcript
+- highlights
+- 相关缓存 summary（如果单独存）
+
+---
+
+## 11. `POST /media/cleanup`
+
+### 用途
+
+按条件批量清理缓存视频，防止长期占用空间。
+
+### 输入
+
+```json
+{
+  "older_than_days": 7,
+  "only_unreferenced": true,
+  "limit": 100,
+  "dry_run": true
+}
+```
+
+### 字段说明
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `older_than_days` | integer | 否 | 删除多少天前的媒体 |
+| `only_unreferenced` | boolean | 否 | 只清理未被引用的媒体 |
+| `limit` | integer | 否 | 单次最多处理数量 |
+| `dry_run` | boolean | 否 | 只预览，不真正删除 |
+
+### 输出
+
+```json
+{
+  "ok": true,
+  "data": {
+    "dry_run": true,
+    "matched_count": 42,
+    "deleted_count": 0,
+    "candidates": [
+      {
+        "media_id": "md_001",
+        "local_video_path": "/data/videos/md_001.mp4",
+        "size_bytes": 12503456
+      }
+    ]
+  },
+  "meta": {
+    "request_id": "req_xxx"
+  }
+}
+```
+
+### 说明
+
+推荐默认先用 `dry_run=true`，避免误删。
+
+---
+
+# 三、建议保留的统一响应格式
+
+所有接口统一采用：
+
+## 成功
+
+```json
+{
+  "ok": true,
+  "data": {},
+  "meta": {
+    "request_id": "req_xxx",
+    "elapsed_ms": 123
+  }
+}
+```
+
+## 失败

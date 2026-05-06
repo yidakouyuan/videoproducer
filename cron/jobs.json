@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "jobs": [
+    {
+      "id": "23be4a13-dd72-417c-983f-21e914b76529",
+      "agentId": "main",
+      "sessionKey": "agent:main:main",
+      "name": "douyin-bridge-inbox-check",
+      "enabled": false,
+      "createdAtMs": 1773410039403,
+      "schedule": {
+        "kind": "cron",
+        "expr": "* * * * *",
+        "tz": "Asia/Shanghai"
+      },
+      "sessionTarget": "main",
+      "wakeMode": "now",
+      "payload": {
+        "kind": "systemEvent",
+        "text": "Bridge check: inspect /home/administrator/.openclaw/workspace/bridge-inbox/douyin-publish-request.json for pending douyin_publish handoff. If present and not yet processed, execute it via the local Windows publisher service, update bridge-inbox result file, and report only meaningful state changes."
+      },
+      "state": {}
+    },
+    {
+      "id": "ef1e4267-dd08-4a2e-a742-940f32b76544",
+      "agentId": "stats-collector",
+      "name": "stats-collector",
+      "enabled": false,
+      "createdAtMs": 1773641346617,
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 */6 * * *",
+        "tz": "Asia/Shanghai",
+        "staggerMs": 300000
+      },
+      "sessionTarget": "isolated",
+      "wakeMode": "now",
+      "payload": {
+        "kind": "agentTurn",
+        "message": "Collect video stats from Douyin Creator Center and write to database"
+      },
+      "delivery": {
+        "mode": "announce",
+        "channel": "last"
+      },
+      "state": {}
+    },
+    {
+      "id": "b21b8a84-4bc0-4c25-8ca6-8ee94bcb798f",
+      "agentId": "stats-analyzer",
+      "name": "stats-analyzer",
+      "enabled": false,
+      "createdAtMs": 1773641460085,
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 9 * * 1",
+        "tz": "Asia/Shanghai"
+      },
+      "sessionTarget": "isolated",
+      "wakeMode": "now",
+      "payload": {
+        "kind": "agentTurn",
+        "message": "Analyze video performance stats from database and generate weekly report"
+      },
+      "delivery": {
+        "mode": "announce",
+        "channel": "last"
+      },
+      "state": {}
+    }
+  ]
+}

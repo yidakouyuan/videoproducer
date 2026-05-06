@@ -1,0 +1,28 @@
+{
+  "id": "video-http-tools",
+  "name": "Video HTTP Tools",
+  "description": "Wrap local video/media HTTP endpoints as OpenClaw agent tools",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string",
+        "default": "http://127.0.0.1:8000",
+        "description": "Base URL of the local HTTP service"
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "default": 60000,
+        "description": "HTTP request timeout in ms. Video generation polling requires at least 60000."
+      },
+      "apiKey": {
+        "type": "string",
+        "description": "Optional API key for the backend service"
+      }
+    },
+    "required": []
+  }
+}

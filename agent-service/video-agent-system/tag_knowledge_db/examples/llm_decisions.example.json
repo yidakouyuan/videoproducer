@@ -1,0 +1,38 @@
+{
+  "synonym_updates": [
+    {
+      "raw_tag": "影娱热点团",
+      "canonical_name": "内容启发搜索",
+      "alias_source": "llm",
+      "confidence": 0.88
+    }
+  ],
+  "kind_updates": [
+    {
+      "canonical_name": "内容启发搜索",
+      "tag_kind": "campaign",
+      "kind_source": "llm",
+      "confidence": 0.93
+    }
+  ],
+  "tag_card_updates": [
+    {
+      "canonical_name": "内容启发搜索",
+      "card_text": "内容启发搜索是活动入口类标签，通常作为选题发现与参与引导，建议联动具体主题标签生成脚本。",
+      "source": "llm",
+      "evidence": {
+        "note": "example"
+      }
+    }
+  ],
+  "community_report_updates": [
+    {
+      "community_id": 1,
+      "report_text": "社区样例报告：请根据 top tags 与高互动标题抽象出主题方向、叙事套路与可执行脚本骨架。",
+      "source": "llm"
+    }
+  ],
+  "complete_task_keys": [
+    "raw:影娱热点团"
+  ]
+}

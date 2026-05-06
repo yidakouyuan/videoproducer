@@ -1,0 +1,184 @@
+## 1. 项目背景与目标
+
+### 1.1 背景
+
+我们持续从抖音抓取视频元数据（标题、标签、互动统计等）。希望把大量离散的标签（tag）组织成一个可用于“选题发现与脚本生成”的离线知识结构。
+
+### 1.2 核心目标
+
+构建一个以 **Tag 为核心**的离线系统，使得输入一个 tag（例如“美食”“野外烹饪”）时能够返回：
+
+1. 与该 tag 强相关的一组 tag（共现关系）
+2. 该 tag 所属的主题社区（topic cluster），以及社区内更细方向（子社区/上升方向）
+3. 为脚本生成准备好的“素材包”：社区摘要（Community Report）+ Tag Card + 证据包（Evidence Pack）
+4. 下游由另一个 LLM 基于素材包生成脚本，且尽量减少跑偏与胡编
+
+
+## 4. 批处理流程设计（重点：全局去重 + LLM 同义归并 + LLM 分类）
+
+> 你强调的“去重”是：每次一批视频会带来大量 tag，需要在**全局历史范围**做去重与归并。下面流程按这个理解设计。
+> 
+
+### 4.1 Tag 标准化（Normalization）
+
+对每批视频提取 tag 后，对每个 tag 做最基础清洗：
+
+- 去掉 `#`、空格、统一全半角与大小写
+- 去除空串/异常符号 tag
+- 等等..
+
+### 4.2 全局去重（Global Dedup）
+
+目标：识别“此前已存在的 tag”与“本批新增 tag”。
+
+- 维护全局 tag 字典（canonical & raw）
+- 本批处理时：
+    - `existing_raw_tags`：已出现过的 raw tag
+    - `new_raw_tags`：首次出现的 raw tag（进入 LLM 流程）
+
+> 注意：这里的“去重”不是同一视频内部，而是**跨视频、跨批次的全局 tag 去重**。
+> 
+
+### 4.3 LLM 同义归并（只用 LLM，无候选召回）
+
+对 `new_raw_tags`让 LLM 完成同义归并
+
+llm使用 
+
+**输入给 LLM 的证据（不需要存具体内容）**
+
+为了让同义判断更可靠，给 LLM 的上下文仅用“标题样本”：
+
+- 对每个 raw tag，抽取它出现过的代表标题 TopN（例如 3–10 条）
+
+这样 LLM 判断同义不是只看字面，而是看“在标题语境里指的是什么”。
+
+### 4.4 LLM Tag 分类（Topic vs Campaign，不可混）
+
+同义归并后，对每个 canonical tag 让 LLM 输出分类：
+
+- `tag_kind ∈ {topic, campaign}`
+
+### 4.5 产物入库（Batch 输出）
+
+每批处理结束，更新/新增以下核心资产：
+
+- canonical tag 集合（TagNode）
+- alias 映射~~与同义边（AliasEdge）~~
+- tag 分类（TagKind）
+- 视频轻量元数据（VideoMeta：title+metrics+time+tags）
+- 等等…你来具体设计吧…
+
+---
+
+## 5. 图谱构建（共现边 +1，topic/campaign 分离）
+
+### 5.1 节点（Entities）
+
+- 一个 canonical tag = 一个节点
+- 节点属性（建议至少维护）：
+    - `tag_kind`（topic/campaign）
+    - 全局频次与热度：出现视频数、收藏/点赞汇总
+    - 代表视频ID列表（只存ID与标题/统计，不存内容）
+
+### 5.2 边（Relationships）：共现关系（Fast 风格）
+
+你采用“fast-graphrag式共现”：
+
+- 对每条视频的 canonical tag 集合 TTT
+- 加一个时间衰减的系数..！
+- 任意两 tag 同时出现：边权 `weight += 1`
+
+为支持趋势与证据，我们同时维护：
+
+- 总共现计数 `co_cnt`
+
+### 5.3 Topic 与 Campaign 不混的落地方式（关键）
+
+- **Topic-Topic 共现边**：构成“主题共现图”，用于 Leiden 聚类
+- **Campaign-Topic 关联边**：单独维护，用于“入口标签→主题方向”映射，但**不参与聚类**
+- Campaign-Campaign 通常不建（容易噪声大且价值低）
+
+---
+
+## 6. GraphRAG BYOG 集成（社区聚类 + 社区报告）
+
+### 6.1 BYOG 路线选择
+
+我们不使用 GraphRAG 从文本抽图的前半段（抽实体/抽关系），而是自建 tag 图（Entities/Relationships），然后复用 GraphRAG 的后半段能力：
+
+- `create_communities`：对 topic-only 图跑 **分层 Leiden 社区**
+- `create_community_reports_text`：生成社区摘要
+
+## 7. 摘要与素材资产（融合 Tag Card / Community Report / Evidence Pack）
+
+### 7.1 Tag Card（每个 Tag 1–2 句，存库）
+
+**目的**：去歧义 + 直接给脚本 LLM 定调。
+
+**生成依据（只用标题与共现）：**
+
+- 该 tag 的代表标题 TopN（标题+统计）
+- 该 tag 的共现 TopK（来自共现图）
+
+### 7.2 Community Report（社区报告，重点投入）
+
+**目的**：把一个社区变成“选题包/套路包”，这是脚本生成的主燃料。
+
+**输入（topic-only）：**
+
+- 社区 top tags（Top 20）
+- 社区代表视频标题 TopN（例如 20–50，带收藏/点赞）
+- 社区强共现边 TopN
+
+**输出结构：**
+
+【这个输出我觉得就按照原本的graphrag做也行】
+
+### 7.3 Evidence Psack（证据包，查询时必带）
+
+**目的**：让脚本 LLM“有据可依”，减少编造。
+
+对输入 tag（或社区）返回：
+
+- Top 标题样本（title + metrics + time）
+- Top 共现 tags（含 co_cnt 与近期 co_cnt_7d）
+- （可选）Top 搭配组合（强边/三元组）
+
+## 8. 查询与返回（给脚本 LLM 的标准输入包）
+
+### 8.1 Topic Tag 查询
+
+输入 topic tag 后输出：
+
+- A) Tag Card（1–2句）
+- B) 所属社区信息（community_id + 主题一句话）
+- C) Community Report（该社区的选题包/套路包）
+- D) 共现 TopK（优先同社区内排序，减少噪声）
+- E) Evidence Pack（标题样本+指标+趋势）
+
+### 8.2 Campaign Tag 查询
+
+输入 campaign tag 时不跑 Leiden（它不参与聚类），改返回：
+
+- A) Campaign 的 Tag Card（可更偏“活动入口/参与方式”）
+- B) 关联的 Topic 社区列表（按共现强度/收藏权重排序）
+- C) 每个候选社区的简要摘要 + Evidence Pack（供脚本选择方向）
+
+## 9. 增量更新策略（批处理友好）
+
+### 9.1 每批必做（低成本）
+
+- 更新 VideoMeta（只存标题+统计+时间+canonical tags）
+- 更新 TagNode 统计（频次/热度/趋势）
+- 更新共现边（topic-topic、campaign-topic）权重 +1，更新 7d/30d 滑窗
+
+### 9.2 LLM 步骤（只对“新增/变化大”的部分触发）
+
+- 新出现的 raw tags：做 LLM 同义归并 + 分类
+
+### 9.3 社区与报告的重算（不建议每批都跑）
+
+（就按照天数/统计量来看吧..）
+
+- 社区（Leiden）：建议“定期 + 触发式”（例如每天一次或增长超过阈值）

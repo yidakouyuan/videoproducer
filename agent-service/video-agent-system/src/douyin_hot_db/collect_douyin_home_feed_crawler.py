@@ -1,0 +1,1493 @@
+#!/usr/bin/env python3
+"""Collect Douyin home feed videos via web crawling."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import time
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+
+try:
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import Page, sync_playwright
+except ImportError as exc:  # pragma: no cover
+    raise RuntimeError(
+        "playwright is required. Run: pip install playwright && playwright install chromium"
+    ) from exc
+
+SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+DEFAULT_HOME_URL = "https://www.douyin.com/"
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/130.0.0.0 Safari/537.36"
+)
+
+FEED_URL_HINTS = (
+    "/aweme/v1/web/homepage/feed/",
+    "/aweme/v1/web/tab/feed/",
+    "/aweme/v1/web/recommend/feed/",
+    "/aweme/v1/web/recommend/list/",
+    "/aweme/v1/web/aweme/post/",
+    "/aweme/v1/web/feed/",
+    "/aweme/v1/web/recommend/",
+    "/aweme/v1/web/channel/feed/",
+)
+
+RELATED_URL_HINTS = (
+    "/aweme/v1/web/aweme/related/",
+    "/aweme/v1/web/mix/aweme/",
+    "/aweme/v1/web/aweme/detail/",
+)
+
+GENERIC_AWEME_HINT = "/aweme/v1/web/"
+
+AWEME_BLOCKLIST_HINTS = (
+    "/aweme/v1/web/social/count",
+    "/aweme/v1/web/query/user/",
+    "/aweme/v1/web/emoji/list",
+    "/aweme/v1/web/get/user/settings",
+    "/aweme/v1/web/api/suggest_words/",
+    "/aweme/v1/web/seo/",
+    "/aweme/v1/web/solution/resource/",
+    "/aweme/v1/web/page/turn/offline",
+    "/aweme/v1/web/danmaku/",
+)
+
+RESPONSE_NOISE_HINTS = (
+    "/monitor_web/settings/",
+    "/vc/setting",
+    "/captcha/",
+    "/passport/web/check_qrconnect/",
+    "mcs.zijieapi.com/list",
+)
+
+
+@dataclass
+class FeedVideo:
+    aweme_id: str
+    desc: str | None
+    create_time: int | None
+    author_id: str | None
+    author_name: str | None
+    author_sec_uid: str | None
+    author_unique_id: str | None
+    cover_url: str | None
+    video_url: str | None
+    duration: int | None
+    height: int | None
+    width: int | None
+    digg_count: int | None
+    comment_count: int | None
+    collect_count: int | None
+    share_count: int | None
+    play_count: int | None
+    tags: list[tuple[str, str]]
+    source_api_url: str
+    source_score: int
+    first_seen_seq: int
+    raw: dict[str, Any]
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def to_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_count_text(text: str | None) -> int | None:
+    if text is None:
+        return None
+    t = str(text).strip().replace(",", "").replace("+", "")
+    if not t:
+        return None
+    m = re.match(r"^(\d+(?:\.\d+)?)([万亿wW]?)$", t)
+    if not m:
+        return to_int(t)
+    base = float(m.group(1))
+    unit = m.group(2)
+    if unit in ("万", "w", "W"):
+        base *= 10_000
+    elif unit == "亿":
+        base *= 100_000_000
+    return int(base)
+
+
+def pick_first_url(value: Any) -> str | None:
+    if isinstance(value, dict):
+        candidates = value.get("url_list")
+        if isinstance(candidates, list) and candidates:
+            first = candidates[0]
+            return str(first) if first is not None else None
+    if isinstance(value, list) and value:
+        first = value[0]
+        return str(first) if first is not None else None
+    return None
+
+
+def ensure_db(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    with SCHEMA_PATH.open("r", encoding="utf-8") as f:
+        conn.executescript(f.read())
+    conn.commit()
+    return conn
+
+
+def stealth_script() -> str:
+    return """
+(() => {
+  try {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+    Object.defineProperty(navigator, 'language', { get: () => 'zh-CN' });
+    Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en-US', 'en'] });
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+    if (!window.chrome) {
+      Object.defineProperty(window, 'chrome', { value: { runtime: {} } });
+    }
+    const originalQuery = navigator.permissions && navigator.permissions.query;
+    if (originalQuery) {
+      navigator.permissions.query = (parameters) => (
+        parameters && parameters.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : originalQuery(parameters)
+      );
+    }
+  } catch (_) {}
+})();
+"""
+
+
+def parse_json_like_text(text: str) -> Any | None:
+    raw = text.strip()
+    if not raw:
+        return None
+
+    candidates = [raw]
+
+    # Some APIs prepend anti-JSON-hijacking prefix.
+    if raw.startswith("for (;;);"):
+        candidates.append(raw[len("for (;;);") :].strip())
+
+    for first in ("{", "["):
+        idx = raw.find(first)
+        if idx > 0:
+            candidates.append(raw[idx:].strip())
+
+    for cand in candidates:
+        if not cand:
+            continue
+        try:
+            parsed = json.loads(cand)
+        except Exception:
+            continue
+        if isinstance(parsed, str):
+            nested = parsed.strip()
+            if nested.startswith("{") or nested.startswith("["):
+                try:
+                    parsed = json.loads(nested)
+                except Exception:
+                    pass
+        if isinstance(parsed, (dict, list)):
+            return parsed
+    return None
+
+
+def extract_response_payload(resp: Any) -> Any | None:
+    data: Any | None = None
+    try:
+        data = resp.json()
+    except Exception:
+        data = None
+
+    if isinstance(data, (dict, list)):
+        return data
+
+    # Fallback: some responses are not parsed by resp.json() directly.
+    try:
+        text = resp.text()
+    except Exception:
+        return None
+    return parse_json_like_text(text)
+
+
+def is_candidate_response_url(url: str) -> bool:
+    lower = url.lower()
+    if any(hint in lower for hint in RESPONSE_NOISE_HINTS):
+        return False
+    if any(hint in lower for hint in FEED_URL_HINTS):
+        return True
+    if any(hint in lower for hint in RELATED_URL_HINTS):
+        return True
+    if GENERIC_AWEME_HINT in lower and not any(h in lower for h in AWEME_BLOCKLIST_HINTS):
+        return True
+    if "/feed/" in lower or "/recommend/" in lower:
+        return True
+    return False
+
+
+def shorten_url(url: str, max_len: int = 220) -> str:
+    if len(url) <= max_len:
+        return url
+    return f"{url[:max_len]}..."
+
+
+def extract_aweme_id_from_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    m = re.search(r"/(?:video|note)/(\d+)", str(url))
+    if not m:
+        return None
+    return m.group(1)
+
+
+def first_aweme_id(videos: list[FeedVideo]) -> str | None:
+    for video in videos:
+        aweme_id = str(video.aweme_id or "").strip()
+        if aweme_id:
+            return aweme_id
+    return None
+
+
+def resolve_current_aweme_id(
+    page_url: str | None,
+    payload_videos: list[FeedVideo],
+    dom_candidates: list[FeedVideo],
+) -> str | None:
+    url_aweme_id = extract_aweme_id_from_url(page_url)
+    if url_aweme_id:
+        return url_aweme_id
+    dom_aweme_id = first_aweme_id(dom_candidates)
+    if dom_aweme_id:
+        return dom_aweme_id
+    return first_aweme_id(payload_videos)
+
+
+def pick_seed_swipe_video(
+    payload_videos: list[FeedVideo],
+    dom_candidates: list[FeedVideo],
+    page_aweme_id: str | None,
+) -> FeedVideo | None:
+    """Pick one "current" video in seed swipe mode."""
+    if page_aweme_id:
+        for video in dom_candidates:
+            if video.aweme_id == page_aweme_id:
+                return video
+        for video in payload_videos:
+            if video.aweme_id == page_aweme_id:
+                return video
+    if dom_candidates:
+        return dom_candidates[0]
+    if payload_videos:
+        return payload_videos[0]
+    return None
+
+
+def extract_page_visible_aweme_id(page: Page) -> str | None:
+    dom_items, _ = extract_dom_visible_items(page, max_cards=5)
+    for item in dom_items:
+        aweme_id = str(item.get("aweme_id") or "").strip()
+        if aweme_id:
+            return aweme_id
+    return extract_aweme_id_from_url(page.url)
+
+
+def advance_seed_video_by_swipe(
+    page: Page,
+    current_aweme_id: str | None,
+    action_wait_seconds: float,
+    round_wait_seconds: float,
+    scroll_pixels: int,
+) -> str | None:
+    """Try to move to next video by swipe/keyboard and return new aweme_id."""
+    baseline_aweme_id = current_aweme_id or extract_page_visible_aweme_id(page)
+    for _ in range(4):
+        dismiss_common_popups(page)
+        # Ensure keyboard events hit the video container.
+        page.mouse.click(720, 420)
+        page.keyboard.press("ArrowDown")
+        page.wait_for_timeout(int(max(action_wait_seconds, 0.6) * 1000))
+        page.keyboard.press("PageDown")
+        page.wait_for_timeout(int(max(action_wait_seconds, 0.6) * 600))
+        page.mouse.wheel(0, scroll_pixels)
+        page.wait_for_timeout(int(max(round_wait_seconds, 0.8) * 1000))
+        dismiss_common_popups(page)
+        page.mouse.click(720, 420)
+        next_aweme_id = extract_page_visible_aweme_id(page)
+        if next_aweme_id and next_aweme_id != baseline_aweme_id:
+            return next_aweme_id
+    return None
+
+
+def pick_unseen_candidate_aweme_id(
+    dom_candidates: list[FeedVideo],
+    payload_videos: list[FeedVideo],
+    current_aweme_id: str | None,
+    visited_seed_pages: set[str],
+) -> str | None:
+    for group in (dom_candidates, payload_videos):
+        for video in group:
+            candidate = video.aweme_id
+            if not candidate:
+                continue
+            if candidate == current_aweme_id:
+                continue
+            if candidate in visited_seed_pages:
+                continue
+            return candidate
+    return None
+
+
+def resolve_seed_video_url(conn: sqlite3.Connection, args: argparse.Namespace) -> str | None:
+    if args.seed_url:
+        return args.seed_url
+    if args.seed_aweme_id:
+        return f"https://www.douyin.com/video/{args.seed_aweme_id}"
+    row = conn.execute(
+        """
+        SELECT aweme_id
+        FROM videos
+        WHERE aweme_id IS NOT NULL
+          AND aweme_id <> ''
+        ORDER BY last_seen_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if not row:
+        return None
+    return f"https://www.douyin.com/video/{row['aweme_id']}"
+
+
+def dismiss_common_popups(page: Page) -> bool:
+    clicked = page.evaluate(
+        """
+        () => {
+          const closeSelectors = [
+            '[aria-label="关闭"]',
+            '[class*="close"]',
+            'button[title*="关闭"]',
+            'div[role="button"][aria-label*="关闭"]',
+          ];
+          const clickIfVisible = (n) => {
+            if (!(n instanceof HTMLElement)) return false;
+            const style = window.getComputedStyle(n);
+            if (style.visibility === 'hidden' || style.display === 'none') return false;
+            const rect = n.getBoundingClientRect();
+            if (rect.width < 8 || rect.height < 8) return false;
+            n.click();
+            return true;
+          };
+
+          for (const sel of closeSelectors) {
+            const nodes = Array.from(document.querySelectorAll(sel));
+            for (const n of nodes) {
+              if (clickIfVisible(n)) return true;
+            }
+          }
+
+          const textTargets = ['知道了', '稍后', '以后再说', '关闭'];
+          const textNodes = Array.from(document.querySelectorAll('button,div[role="button"],span'));
+          for (const node of textNodes) {
+            const txt = (node.textContent || '').trim();
+            if (!txt) continue;
+            if (!textTargets.some((k) => txt.includes(k))) continue;
+            if (clickIfVisible(node)) return true;
+          }
+
+          return false;
+        }
+        """
+    )
+    return bool(clicked)
+
+
+def inspect_page_state(page: Page) -> dict[str, Any]:
+    data = page.evaluate(
+        """
+        () => {
+          const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+          const bodyText = normalize(document.body ? document.body.innerText : '');
+          const title = normalize(document.title || '');
+          const loginDetected =
+            /(扫码登录|登录后|请登录|手机号登录|二维码登录|账号登录)/i.test(bodyText) ||
+            /passport|login/i.test(window.location.href);
+          const captchaDetected = /(captcha|安全验证|滑块|请完成验证|验证后继续)/i.test(bodyText);
+
+          let visibleVideoCount = 0;
+          const videos = Array.from(document.querySelectorAll('video'));
+          for (const v of videos) {
+            const r = v.getBoundingClientRect();
+            const area = Math.max(0, r.width) * Math.max(0, r.height);
+            if (area < 40000) continue;
+            if (r.bottom < 0 || r.top > window.innerHeight) continue;
+            visibleVideoCount += 1;
+          }
+
+          const videoLinks = document.querySelectorAll('a[href*="/video/"]').length;
+          const noteLinks = document.querySelectorAll('a[href*="/note/"]').length;
+
+          return {
+            page_url: window.location.href,
+            title: title,
+            login_detected: loginDetected,
+            captcha_detected: captchaDetected,
+            visible_video_count: visibleVideoCount,
+            video_link_count: videoLinks,
+            note_link_count: noteLinks,
+            body_preview: bodyText.slice(0, 120),
+          };
+        }
+        """
+    )
+    if not isinstance(data, dict):
+        return {
+            "page_url": page.url,
+            "title": "",
+            "login_detected": False,
+            "captcha_detected": False,
+            "visible_video_count": 0,
+            "video_link_count": 0,
+            "note_link_count": 0,
+            "body_preview": "",
+        }
+    return data
+
+
+def dump_round_debug(
+    debug_dump_dir: Path,
+    run_id: str,
+    round_idx: int,
+    page_state: dict[str, Any],
+    payloads: list[tuple[str, Any]],
+) -> None:
+    debug_dump_dir.mkdir(parents=True, exist_ok=True)
+    records: list[dict[str, Any]] = []
+    for url, payload in payloads[:200]:
+        if isinstance(payload, dict):
+            top_keys = list(payload.keys())[:20]
+        elif isinstance(payload, list):
+            top_keys = [f"list_len={len(payload)}"]
+        else:
+            top_keys = [type(payload).__name__]
+        records.append(
+            {
+                "url": url,
+                "is_home_feed_url": is_home_feed_payload_url(url, include_related=True),
+                "has_aweme": payload_contains_aweme(payload),
+                "top_keys": top_keys,
+            }
+        )
+
+    path = debug_dump_dir / f"{run_id}_round{round_idx:03d}.json"
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "round": round_idx,
+                "page_state": page_state,
+                "payload_count": len(payloads),
+                "payloads": records,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def is_aweme_like(node: dict[str, Any]) -> bool:
+    aweme_id = node.get("aweme_id") or node.get("awemeId")
+    if aweme_id is None:
+        return False
+    return any(k in node for k in ("video", "statistics", "desc", "author"))
+
+
+def collect_aweme_nodes(node: Any, out: list[dict[str, Any]]) -> None:
+    if isinstance(node, dict):
+        if is_aweme_like(node):
+            out.append(node)
+        for value in node.values():
+            collect_aweme_nodes(value, out)
+        return
+    if isinstance(node, list):
+        for value in node:
+            collect_aweme_nodes(value, out)
+
+
+def payload_contains_aweme(payload: Any) -> bool:
+    nodes: list[dict[str, Any]] = []
+    collect_aweme_nodes(payload, nodes)
+    return bool(nodes)
+
+
+def extract_tags(aweme: dict[str, Any]) -> list[tuple[str, str]]:
+    tags: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    text_extra = aweme.get("text_extra")
+    if isinstance(text_extra, list):
+        for item in text_extra:
+            if not isinstance(item, dict):
+                continue
+            tag_name = item.get("hashtag_name") or item.get("hashtag") or item.get("tag_name")
+            if tag_name is None:
+                continue
+            tag = str(tag_name).strip()
+            if not tag or tag in seen:
+                continue
+            seen.add(tag)
+            tags.append((tag, "hashtag"))
+
+    cha_list = aweme.get("cha_list")
+    if isinstance(cha_list, list):
+        for item in cha_list:
+            if not isinstance(item, dict):
+                continue
+            cha_name = item.get("cha_name") or item.get("name")
+            if cha_name is None:
+                continue
+            tag = str(cha_name).strip()
+            if not tag or tag in seen:
+                continue
+            seen.add(tag)
+            tags.append((tag, "challenge"))
+
+    return tags
+
+
+def extract_tags_from_title(title: str | None) -> list[tuple[str, str]]:
+    if not title:
+        return []
+    seen: set[str] = set()
+    tags: list[tuple[str, str]] = []
+    for m in re.finditer(r"#([^\s#]{1,30})", title):
+        tag = m.group(1).strip()
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        tags.append((tag, "hashtag"))
+    return tags
+
+
+def normalize_aweme(aweme: dict[str, Any], source_api_url: str, first_seen_seq: int) -> FeedVideo | None:
+    nested_aweme = aweme.get("aweme_info") or aweme.get("aweme")
+    if isinstance(nested_aweme, dict):
+        nested_aweme_id = nested_aweme.get("aweme_id") or nested_aweme.get("awemeId")
+        if nested_aweme_id is not None:
+            aweme = nested_aweme
+
+    aweme_id = aweme.get("aweme_id") or aweme.get("awemeId")
+    if aweme_id is None:
+        return None
+
+    author_raw = aweme.get("author") or aweme.get("author_info")
+    video_raw = aweme.get("video") or aweme.get("video_info")
+    stats_raw = aweme.get("statistics") or aweme.get("stats")
+
+    author = author_raw if isinstance(author_raw, dict) else {}
+    video = video_raw if isinstance(video_raw, dict) else {}
+    stats = stats_raw if isinstance(stats_raw, dict) else {}
+
+    cover_url = (
+        pick_first_url(aweme.get("cover"))
+        or pick_first_url(video.get("cover"))
+        or pick_first_url(video.get("origin_cover"))
+    )
+    video_url = pick_first_url(video.get("play_addr"))
+
+    return FeedVideo(
+        aweme_id=str(aweme_id),
+        desc=aweme.get("desc") or aweme.get("title") or aweme.get("aweme_title"),
+        create_time=to_int(aweme.get("create_time")),
+        author_id=str(author.get("uid") or author.get("id")) if author else None,
+        author_name=author.get("nickname") or author.get("name") or author.get("author_name"),
+        author_sec_uid=author.get("sec_uid"),
+        author_unique_id=author.get("unique_id"),
+        cover_url=cover_url,
+        video_url=video_url,
+        duration=to_int(video.get("duration")),
+        height=to_int(video.get("height")),
+        width=to_int(video.get("width")),
+        digg_count=to_int(stats.get("digg_count") or stats.get("diggCount")),
+        comment_count=to_int(stats.get("comment_count") or stats.get("commentCount")),
+        collect_count=to_int(stats.get("collect_count") or stats.get("collects")),
+        share_count=to_int(stats.get("share_count") or stats.get("shareCount")),
+        play_count=to_int(stats.get("play_count") or stats.get("playCount")),
+        tags=extract_tags(aweme),
+        source_api_url=source_api_url,
+        source_score=source_score(source_api_url),
+        first_seen_seq=first_seen_seq,
+        raw=aweme,
+    )
+
+
+def normalize_dom_item(item: dict[str, Any], first_seen_seq: int) -> FeedVideo | None:
+    aweme_id = item.get("aweme_id")
+    if aweme_id is None:
+        return None
+    title = str(item.get("title") or "").strip() or None
+    video_src = str(item.get("video_src") or "").strip() or None
+    video_page_url = str(item.get("video_page_url") or "").strip() or None
+
+    return FeedVideo(
+        aweme_id=str(aweme_id),
+        desc=title,
+        create_time=None,
+        author_id=None,
+        author_name=str(item.get("author_name") or "").strip() or None,
+        author_sec_uid=None,
+        author_unique_id=None,
+        cover_url=None,
+        video_url=video_src or video_page_url,
+        duration=None,
+        height=None,
+        width=None,
+        digg_count=parse_count_text(item.get("digg_text")),
+        comment_count=parse_count_text(item.get("comment_text")),
+        collect_count=parse_count_text(item.get("collect_text")),
+        share_count=parse_count_text(item.get("share_text")),
+        play_count=None,
+        tags=extract_tags_from_title(title),
+        source_api_url="dom://home-visible",
+        source_score=1,
+        first_seen_seq=first_seen_seq,
+        raw=item,
+    )
+
+
+def source_score(source_api_url: str) -> int:
+    url = source_api_url.lower()
+    if any(hint in url for hint in FEED_URL_HINTS):
+        return 4
+    if GENERIC_AWEME_HINT in url and not any(h in url for h in AWEME_BLOCKLIST_HINTS):
+        return 3
+    if "/aweme/v1/web/aweme/detail/" in url:
+        return 2
+    if "/aweme/v1/web/aweme/related/" in url:
+        return 1
+    if "/aweme/v1/web/mix/aweme/" in url:
+        return 1
+    return 0
+
+
+def is_home_feed_payload_url(url: str, include_related: bool) -> bool:
+    lower = url.lower()
+    if any(hint in lower for hint in FEED_URL_HINTS):
+        return True
+    if GENERIC_AWEME_HINT in lower and not any(h in lower for h in AWEME_BLOCKLIST_HINTS):
+        return True
+    if include_related and any(hint in lower for hint in RELATED_URL_HINTS):
+        return True
+    return False
+
+
+def parse_payloads_for_round(
+    payloads: list[tuple[str, Any]],
+    videos_per_round: int,
+    include_related: bool,
+) -> list[FeedVideo]:
+    seq = 0
+    selected: dict[str, FeedVideo] = {}
+
+    def ingest(source_api_url: str, payload: Any) -> None:
+        nonlocal seq
+        aweme_nodes: list[dict[str, Any]] = []
+        collect_aweme_nodes(payload, aweme_nodes)
+        for aweme in aweme_nodes:
+            seq += 1
+            video = normalize_aweme(aweme, source_api_url=source_api_url, first_seen_seq=seq)
+            if video is None:
+                continue
+            existed = selected.get(video.aweme_id)
+            if existed is None:
+                selected[video.aweme_id] = video
+                continue
+            # Prefer videos extracted from stronger source API.
+            if video.source_score > existed.source_score:
+                selected[video.aweme_id] = video
+
+    # Pass 1: strict URL filtering (low-noise).
+    for source_api_url, payload in payloads:
+        if not is_home_feed_payload_url(source_api_url, include_related=include_related):
+            continue
+        ingest(source_api_url, payload)
+
+    # Pass 2: fallback for homepage API variations.
+    if not selected:
+        for source_api_url, payload in payloads:
+            if not payload_contains_aweme(payload):
+                continue
+            ingest(source_api_url, payload)
+
+    videos = sorted(selected.values(), key=lambda x: x.first_seen_seq)
+    return videos[:videos_per_round]
+
+
+def extract_dom_visible_items(page: Page, max_cards: int) -> tuple[list[dict[str, Any]], bool]:
+    data = page.evaluate(
+        """
+        (maxCards) => {
+          const normalize = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+          const countRegex = /\\d+(?:\\.\\d+)?(?:万|亿|w|W)?/;
+          const isCount = (s) => countRegex.test(normalize(s || ''));
+          const pickCount = (root, keys) => {
+            const nodes = Array.from(root.querySelectorAll('button,div,span'));
+            for (const node of nodes) {
+              const meta = [
+                node.getAttribute('aria-label') || '',
+                node.getAttribute('title') || '',
+                node.getAttribute('data-e2e') || '',
+                node.className || '',
+              ].join(' ').toLowerCase();
+              if (!keys.some((k) => meta.includes(k))) continue;
+              const txt = normalize(node.innerText || node.textContent || '');
+              const m = txt.match(countRegex);
+              if (m) return m[0];
+            }
+            return '';
+          };
+
+          const bodyText = normalize(document.body ? document.body.innerText : '');
+          const captchaDetected = /(captcha|安全验证|滑块|请完成验证|验证后继续)/i.test(bodyText);
+
+          const roots = [];
+          const videos = Array.from(document.querySelectorAll('video'));
+          for (const v of videos) {
+            const r = v.getBoundingClientRect();
+            const area = Math.max(0, r.width) * Math.max(0, r.height);
+            if (area < 50000) continue;
+            if (r.bottom < 0 || r.top > window.innerHeight) continue;
+            let root = v.parentElement;
+            for (let i = 0; i < 4 && root && root.parentElement; i++) {
+              const textLen = normalize(root.innerText || '').length;
+              if (textLen > 100 && textLen < 5000) break;
+              root = root.parentElement;
+            }
+            if (root) roots.push(root);
+          }
+
+          for (const a of Array.from(document.querySelectorAll('a[href*="/video/"],a[href*="/note/"]')).slice(0, 200)) {
+            const root = a.closest('div,section,article') || a.parentElement;
+            if (root) roots.push(root);
+          }
+
+          const dedupRoot = [];
+          const seenRoot = new Set();
+          for (const r of roots) {
+            if (!r) continue;
+            if (seenRoot.has(r)) continue;
+            seenRoot.add(r);
+            dedupRoot.push(r);
+          }
+
+          const byAweme = new Map();
+          for (const root of dedupRoot) {
+            const links = Array.from(root.querySelectorAll('a[href*="/video/"],a[href*="/note/"]'));
+            for (const a of links) {
+              const href = a.href || '';
+              const m = href.match(/\\/(?:video|note)\\/(\\d+)/);
+              if (!m) continue;
+              const awemeId = m[1];
+              if (byAweme.has(awemeId)) continue;
+
+              const rawText = normalize(root.innerText || '');
+              const lines = rawText
+                .split(/\\n|\\r/)
+                .map((x) => normalize(x))
+                .filter(Boolean);
+              let title = '';
+              for (const line of lines) {
+                if (line.length < 8) continue;
+                if (isCount(line)) continue;
+                if (/^(点赞|评论|分享|收藏)$/i.test(line)) continue;
+                title = line;
+                break;
+              }
+
+              const authorAnchor = root.querySelector('a[href*="/user/"], a[href*="/@"]');
+              const authorName = normalize(authorAnchor ? authorAnchor.textContent : '');
+              const videoEl = root.querySelector('video');
+              const videoSrc = videoEl ? (videoEl.currentSrc || videoEl.src || '') : '';
+
+              const diggText = pickCount(root, ['digg', 'like', '点赞']);
+              const commentText = pickCount(root, ['comment', '评论']);
+              const shareText = pickCount(root, ['share', '分享']);
+              const collectText = pickCount(root, ['collect', '收藏']);
+
+              byAweme.set(awemeId, {
+                aweme_id: awemeId,
+                video_page_url: href,
+                title: title,
+                author_name: authorName,
+                video_src: videoSrc,
+                digg_text: diggText,
+                comment_text: commentText,
+                share_text: shareText,
+                collect_text: collectText,
+              });
+              if (byAweme.size >= maxCards) break;
+            }
+            if (byAweme.size >= maxCards) break;
+          }
+
+          return {
+            captcha_detected: captchaDetected,
+            items: Array.from(byAweme.values()).slice(0, maxCards),
+          };
+        }
+        """,
+        max_cards,
+    )
+
+    if not isinstance(data, dict):
+        return [], False
+    items = data.get("items")
+    if not isinstance(items, list):
+        items = []
+    normalized_items = [x for x in items if isinstance(x, dict)]
+    captcha_detected = bool(data.get("captcha_detected"))
+    return normalized_items, captcha_detected
+
+
+def upsert_video(conn: sqlite3.Connection, video: FeedVideo, seen_at: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO videos(
+          aweme_id, "desc", create_time, author_id, author_name, author_sec_uid, author_unique_id,
+          cover_url, video_url, duration, height, width, first_seen_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(aweme_id) DO UPDATE SET
+          "desc" = excluded."desc",
+          create_time = excluded.create_time,
+          author_id = excluded.author_id,
+          author_name = excluded.author_name,
+          author_sec_uid = excluded.author_sec_uid,
+          author_unique_id = excluded.author_unique_id,
+          cover_url = excluded.cover_url,
+          video_url = excluded.video_url,
+          duration = excluded.duration,
+          height = excluded.height,
+          width = excluded.width,
+          last_seen_at = excluded.last_seen_at
+        """,
+        (
+            video.aweme_id,
+            video.desc,
+            video.create_time,
+            video.author_id,
+            video.author_name,
+            video.author_sec_uid,
+            video.author_unique_id,
+            video.cover_url,
+            video.video_url,
+            video.duration,
+            video.height,
+            video.width,
+            seen_at,
+            seen_at,
+        ),
+    )
+
+
+def insert_home_feed_snapshot(
+    conn: sqlite3.Connection,
+    run_id: str,
+    round_num: int,
+    rank_in_round: int,
+    video: FeedVideo,
+    captured_at: str,
+    page_url: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO home_feed_snapshots(
+          run_id, round_num, rank_in_round, aweme_id, source_api_url, page_url,
+          digg_count, comment_count, collect_count, share_count, play_count, captured_at, raw_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            round_num,
+            rank_in_round,
+            video.aweme_id,
+            video.source_api_url,
+            page_url,
+            video.digg_count,
+            video.comment_count,
+            video.collect_count,
+            video.share_count,
+            video.play_count,
+            captured_at,
+            json.dumps(video.raw, ensure_ascii=False),
+        ),
+    )
+
+
+def upsert_video_tags(conn: sqlite3.Connection, aweme_id: str, tags: list[tuple[str, str]], captured_at: str) -> int:
+    inserted = 0
+    for tag, tag_type in tags:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO video_tags(aweme_id, tag, tag_type, captured_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (aweme_id, tag, tag_type, captured_at),
+        )
+        inserted += cur.rowcount
+    return inserted
+
+
+def update_run_status(
+    conn: sqlite3.Connection, run_id: str, status: str, message: str | None = None
+) -> None:
+    conn.execute(
+        "UPDATE runs SET status = ?, message = ?, ended_at = ? WHERE run_id = ?",
+        (status, message, utc_now_iso(), run_id),
+    )
+    conn.commit()
+
+
+def run_collection(args: argparse.Namespace) -> None:
+    load_dotenv()
+    db_path = Path(args.db).expanduser()
+    conn = ensure_db(db_path)
+
+    run_id = uuid.uuid4().hex
+    conn.execute(
+        """
+        INSERT INTO runs(run_id, source, started_at, status, message)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (run_id, "douyin_home_feed_crawler", utc_now_iso(), "running", None),
+    )
+    conn.commit()
+
+    total_rounds = 0
+    total_videos = 0
+    total_tags = 0
+    total_dom_added = 0
+    dom_used_rounds = 0
+    captcha_rounds = 0
+    login_rounds = 0
+    seed_fallback_used = False
+    started_from_explicit_seed = False
+    traversed_jumps = 0
+    seen_aweme_ids_in_run: set[str] = set()
+    visited_seed_pages: set[str] = set()
+    round_payload_counts: dict[int, int] = {}
+    stopped_by_user = False
+
+    pw = None
+    context = None
+    page = None
+    try:
+        pw = sync_playwright().start()
+        try:
+            context = pw.chromium.launch_persistent_context(
+                user_data_dir=str(Path(args.user_data_dir).expanduser()),
+                headless=args.headless,
+                viewport={"width": 1440, "height": 900},
+                locale="zh-CN",
+                user_agent=args.user_agent,
+                ignore_default_args=["--enable-automation"],
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--lang=zh-CN",
+                ],
+            )
+        except PlaywrightError as exc:
+            err = str(exc)
+            if (not args.headless) and (
+                "Missing X server" in err
+                or "$DISPLAY" in err
+                or "headed browser without having a XServer" in err
+            ):
+                raise RuntimeError(
+                    "headful mode requires an X server. "
+                    "Use headless mode on servers: remove --headful. "
+                    "If needed, run with virtual display: xvfb-run -a python ..."
+                ) from exc
+            raise
+
+        if args.stealth:
+            context.add_init_script(stealth_script())
+            context.set_extra_http_headers({"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
+
+        page = context.pages[0] if context.pages else context.new_page()
+        response_log: list[tuple[str, Any]] = []
+        crawl_mode = "home"
+
+        def on_response(resp: Any) -> None:
+            url = resp.url
+            lower_url = url.lower()
+            try:
+                content_type = resp.headers.get("content-type", "").lower()
+            except Exception:
+                content_type = ""
+
+            if not is_candidate_response_url(url):
+                if "json" not in content_type:
+                    return
+                if not any(host in lower_url for host in ("douyin.com", "zijieapi.com", "snssdk.com")):
+                    return
+
+            data = extract_response_payload(resp)
+            if data is None:
+                return
+            response_log.append((url, data))
+
+        context.on("response", on_response)
+        page.goto(args.home_url, wait_until="domcontentloaded", timeout=args.timeout_ms)
+        page.wait_for_timeout(int(args.startup_wait_seconds * 1000))
+        dismiss_common_popups(page)
+        # Give page focus so keyboard navigation (ArrowDown/PageDown) can work.
+        page.mouse.click(720, 420)
+
+        log_cursor = 0
+        if args.seed_url or args.seed_aweme_id:
+            seed_url = resolve_seed_video_url(conn, args)
+            if seed_url:
+                print(f"[seed] start_from_seed=1 seed_url={shorten_url(seed_url, 180)}")
+                page.goto(seed_url, wait_until="domcontentloaded", timeout=args.timeout_ms)
+                page.wait_for_timeout(int(args.startup_wait_seconds * 1000))
+                dismiss_common_popups(page)
+                page.mouse.click(720, 420)
+                response_log.clear()
+                log_cursor = 0
+                crawl_mode = "seed_video"
+                started_from_explicit_seed = True
+                seed_aweme_id = extract_aweme_id_from_url(seed_url)
+                if seed_aweme_id:
+                    visited_seed_pages.add(seed_aweme_id)
+            else:
+                print("[seed] start_from_seed=0 reason=seed_not_resolved")
+
+        round_idx = 1
+        while args.rounds == 0 or round_idx <= args.rounds:
+            dismiss_common_popups(page)
+
+            pre_round_actions = not (crawl_mode == "seed_video" and args.seed_next_mode == "swipe")
+            if pre_round_actions:
+                for _ in range(args.actions_per_round):
+                    page.keyboard.press("PageDown")
+                    page.wait_for_timeout(int(args.action_wait_seconds * 500))
+                    page.keyboard.press("ArrowDown")
+                    page.wait_for_timeout(int(args.action_wait_seconds * 500))
+                    page.mouse.wheel(0, args.scroll_pixels)
+                    page.wait_for_timeout(int(args.action_wait_seconds * 1000))
+            page.wait_for_timeout(int(args.round_wait_seconds * 1000))
+
+            payloads = response_log[log_cursor:]
+            log_cursor = len(response_log)
+            round_payload_counts[round_idx] = len(payloads)
+
+            aweme_resp_seen = sum(1 for url, _ in payloads if GENERIC_AWEME_HINT in url.lower())
+            feed_api_seen = sum(
+                1 for url, _ in payloads if is_home_feed_payload_url(url, include_related=args.include_related)
+            )
+
+            payload_videos = parse_payloads_for_round(
+                payloads=payloads,
+                videos_per_round=args.videos_per_round,
+                include_related=args.include_related,
+            )
+            videos = list(payload_videos)
+            dom_items, dom_captcha_detected = extract_dom_visible_items(page, max_cards=args.videos_per_round)
+            page_state = inspect_page_state(page)
+            captcha_detected = bool(dom_captcha_detected or page_state.get("captcha_detected"))
+            login_detected = bool(page_state.get("login_detected"))
+            if captcha_detected:
+                captcha_rounds += 1
+            if login_detected:
+                login_rounds += 1
+
+            if args.debug_dump_dir:
+                dump_round_debug(
+                    debug_dump_dir=Path(args.debug_dump_dir).expanduser(),
+                    run_id=run_id,
+                    round_idx=round_idx,
+                    page_state=page_state,
+                    payloads=payloads,
+                )
+
+            dom_candidates: list[FeedVideo] = []
+            start_seq = len(payload_videos)
+            for idx, item in enumerate(dom_items, start=start_seq + 1):
+                parsed = normalize_dom_item(item, first_seen_seq=idx)
+                if parsed is None:
+                    continue
+                dom_candidates.append(parsed)
+
+            dom_added = 0
+            if crawl_mode == "seed_video" and args.seed_next_mode == "swipe":
+                # In swipe mode, keep only one "current" video per round.
+                page_aweme_id = resolve_current_aweme_id(
+                    page_url=str(page_state.get("page_url") or page.url),
+                    payload_videos=payload_videos,
+                    dom_candidates=dom_candidates,
+                )
+                picked = pick_seed_swipe_video(payload_videos, dom_candidates, page_aweme_id=page_aweme_id)
+                if picked is None:
+                    videos = []
+                else:
+                    if picked.source_api_url.startswith("dom://"):
+                        dom_added = 1
+                    videos = [picked]
+            else:
+                existing_ids = {v.aweme_id for v in videos}
+                for dom_video in dom_candidates:
+                    if dom_video.aweme_id in existing_ids:
+                        continue
+                    if len(videos) >= args.videos_per_round:
+                        break
+                    videos.append(dom_video)
+                    existing_ids.add(dom_video.aweme_id)
+                    dom_added += 1
+
+            if dom_added > 0:
+                dom_used_rounds += 1
+                total_dom_added += dom_added
+
+            # One-time automatic fallback: if homepage returns zero videos,
+            # jump to a known video URL and continue with "swipe next" crawling.
+            if (
+                args.auto_seed_fallback
+                and (not seed_fallback_used)
+                and (not started_from_explicit_seed)
+                and total_rounds == 0
+                and len(videos) == 0
+            ):
+                seed_url = resolve_seed_video_url(conn, args)
+                if seed_url:
+                    print(
+                        f"[fallback] switch_to_seed=1 reason=no_videos_first_round "
+                        f"seed_url={shorten_url(seed_url, 180)}"
+                    )
+                    page.goto(seed_url, wait_until="domcontentloaded", timeout=args.timeout_ms)
+                    page.wait_for_timeout(int(args.startup_wait_seconds * 1000))
+                    dismiss_common_popups(page)
+                    page.mouse.click(720, 420)
+                    response_log.clear()
+                    log_cursor = 0
+                    seed_fallback_used = True
+                    crawl_mode = "seed_video"
+                    seed_aweme_id = extract_aweme_id_from_url(seed_url)
+                    if seed_aweme_id:
+                        visited_seed_pages.add(seed_aweme_id)
+                    continue
+                print("[fallback] switch_to_seed=0 reason=no_seed_video_available")
+
+            unique_new_count = 0
+            for video in videos:
+                if video.aweme_id not in seen_aweme_ids_in_run:
+                    unique_new_count += 1
+                    seen_aweme_ids_in_run.add(video.aweme_id)
+
+            captured_at = utc_now_iso()
+            snapshot_page_url = str(page_state.get("page_url") or page.url)
+            for rank_in_round, video in enumerate(videos, start=1):
+                upsert_video(conn, video, seen_at=captured_at)
+                insert_home_feed_snapshot(
+                    conn=conn,
+                    run_id=run_id,
+                    round_num=round_idx,
+                    rank_in_round=rank_in_round,
+                    video=video,
+                    captured_at=captured_at,
+                    page_url=snapshot_page_url,
+                )
+                total_tags += upsert_video_tags(
+                    conn=conn,
+                    aweme_id=video.aweme_id,
+                    tags=video.tags,
+                    captured_at=captured_at,
+                )
+
+            conn.commit()
+            total_rounds += 1
+            total_videos += len(videos)
+
+            current_aweme_id = extract_page_visible_aweme_id(page) or resolve_current_aweme_id(
+                page_url=snapshot_page_url,
+                payload_videos=videos,
+                dom_candidates=dom_candidates,
+            )
+            if current_aweme_id and crawl_mode == "seed_video":
+                visited_seed_pages.add(current_aweme_id)
+
+            next_aweme_id: str | None = None
+            jumped_to_next = False
+            if crawl_mode == "seed_video":
+                if args.seed_next_mode == "swipe":
+                    next_aweme_id = advance_seed_video_by_swipe(
+                        page=page,
+                        current_aweme_id=current_aweme_id,
+                        action_wait_seconds=args.action_wait_seconds,
+                        round_wait_seconds=args.round_wait_seconds,
+                        scroll_pixels=args.scroll_pixels,
+                    )
+                    if next_aweme_id:
+                        visited_seed_pages.add(next_aweme_id)
+                        traversed_jumps += 1
+                        jumped_to_next = True
+                    else:
+                        # Fallback in swipe mode: if swipe cannot advance on current
+                        # page type, move to next unseen related candidate to keep chain progress.
+                        next_aweme_id = pick_unseen_candidate_aweme_id(
+                            dom_candidates=dom_candidates,
+                            payload_videos=payload_videos,
+                            current_aweme_id=current_aweme_id,
+                            visited_seed_pages=visited_seed_pages,
+                        )
+                        if next_aweme_id:
+                            next_url = f"https://www.douyin.com/video/{next_aweme_id}"
+                            try:
+                                page.goto(next_url, wait_until="domcontentloaded", timeout=args.timeout_ms)
+                                page.wait_for_timeout(int(args.startup_wait_seconds * 1000))
+                                dismiss_common_popups(page)
+                                page.mouse.click(720, 420)
+                                response_log.clear()
+                                log_cursor = 0
+                                visited_seed_pages.add(next_aweme_id)
+                                traversed_jumps += 1
+                                jumped_to_next = True
+                            except Exception as exc:
+                                print(f"[jump] switch_to_next=0 next_aweme_id={next_aweme_id} reason={exc}")
+                elif args.traverse_related:
+                    next_aweme_id = pick_unseen_candidate_aweme_id(
+                        dom_candidates=dom_candidates,
+                        payload_videos=payload_videos,
+                        current_aweme_id=current_aweme_id,
+                        visited_seed_pages=visited_seed_pages,
+                    )
+                    if next_aweme_id:
+                        next_url = f"https://www.douyin.com/video/{next_aweme_id}"
+                        try:
+                            page.goto(next_url, wait_until="domcontentloaded", timeout=args.timeout_ms)
+                            page.wait_for_timeout(int(args.startup_wait_seconds * 1000))
+                            dismiss_common_popups(page)
+                            page.mouse.click(720, 420)
+                            response_log.clear()
+                            log_cursor = 0
+                            visited_seed_pages.add(next_aweme_id)
+                            traversed_jumps += 1
+                            jumped_to_next = True
+                        except Exception as exc:
+                            print(f"[jump] switch_to_next=0 next_aweme_id={next_aweme_id} reason={exc}")
+
+            sample_urls = [shorten_url(url, 220) for url, _ in payloads[:3]]
+            sample_text = "none" if not sample_urls else " | ".join(sample_urls)
+            title = str(page_state.get("title") or "").strip()
+            next_aweme_text = next_aweme_id or "none"
+            print(
+                f"[round {round_idx}] mode={crawl_mode} feed_api_seen={feed_api_seen} "
+                f"aweme_resp_seen={aweme_resp_seen} payloads={len(payloads)} videos={len(videos)} "
+                f"unique_new={unique_new_count} "
+                f"dom_added={dom_added} login={int(login_detected)} captcha={int(captcha_detected)} "
+                f"visible_video={int(page_state.get('visible_video_count') or 0)} "
+                f"video_links={int(page_state.get('video_link_count') or 0)} "
+                f"jumped={int(jumped_to_next)} next_aweme_id={next_aweme_text} "
+                f"seed_next_mode={args.seed_next_mode} "
+                f"title={title[:32]} payload_sample={sample_text} "
+                f"include_related={int(args.include_related)}"
+            )
+
+            round_idx += 1
+            if args.round_interval_seconds > 0:
+                time.sleep(args.round_interval_seconds)
+
+    except KeyboardInterrupt:
+        stopped_by_user = True
+    except Exception as exc:
+        update_run_status(conn, run_id, "failed", message=str(exc))
+        raise
+    finally:
+        if page is not None:
+            page.close()
+        if context is not None:
+            context.close()
+        if pw is not None:
+            pw.stop()
+
+        if conn:
+            payload_total = sum(round_payload_counts.values())
+            message = (
+                f"rounds={total_rounds}, videos={total_videos}, tags={total_tags}, "
+                f"payload_total={payload_total}, dom_added={total_dom_added}, "
+                f"dom_used_rounds={dom_used_rounds}, captcha_rounds={captcha_rounds}, "
+                f"unique_aweme={len(seen_aweme_ids_in_run)}, traversed_jumps={traversed_jumps}, "
+                f"login_rounds={login_rounds}, seed_fallback_used={int(seed_fallback_used)}, "
+                f"started_from_explicit_seed={int(started_from_explicit_seed)}, "
+                f"include_related={int(args.include_related)}, "
+                f"stopped_by_user={int(stopped_by_user)}"
+            )
+            if stopped_by_user:
+                update_run_status(conn, run_id, "success", message=message)
+                print(f"home feed crawler stopped by user: run_id={run_id}, {message}, db={db_path}")
+            else:
+                row = conn.execute("SELECT status FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+                if row and row["status"] == "running":
+                    update_run_status(conn, run_id, "success", message=message)
+                    print(f"home feed crawler success: run_id={run_id}, {message}, db={db_path}")
+            conn.close()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Collect Douyin home feed videos into SQLite.")
+    parser.add_argument("--db", default="data/douyin_hot.db", help="SQLite database path.")
+    parser.add_argument(
+        "--user-data-dir",
+        default="data/browser_profile",
+        help="Persistent browser profile dir for session reuse.",
+    )
+    parser.add_argument("--home-url", default=DEFAULT_HOME_URL, help="Douyin home page URL.")
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=10,
+        help="How many rounds to crawl. 0 means endless loop until Ctrl+C.",
+    )
+    parser.add_argument("--videos-per-round", type=int, default=20, help="Max videos saved each round.")
+    parser.add_argument(
+        "--actions-per-round",
+        type=int,
+        default=2,
+        help="How many scroll actions to trigger in each round.",
+    )
+    parser.add_argument("--scroll-pixels", type=int, default=2200, help="Pixels per scroll action.")
+    parser.add_argument(
+        "--startup-wait-seconds",
+        type=float,
+        default=6.0,
+        help="Initial wait after opening home page.",
+    )
+    parser.add_argument(
+        "--action-wait-seconds",
+        type=float,
+        default=1.2,
+        help="Wait after each scroll action.",
+    )
+    parser.add_argument(
+        "--round-wait-seconds",
+        type=float,
+        default=2.0,
+        help="Additional wait at end of each round for responses.",
+    )
+    parser.add_argument(
+        "--round-interval-seconds",
+        type=float,
+        default=0.5,
+        help="Sleep interval between rounds.",
+    )
+    parser.add_argument(
+        "--include-related",
+        action="store_true",
+        help="Also accept related/mix/detail aweme APIs (more videos, more noise).",
+    )
+    parser.add_argument(
+        "--traverse-related",
+        dest="traverse_related",
+        action="store_true",
+        help="In seed-video mode, auto-jump to unseen related video pages each round (default).",
+    )
+    parser.add_argument(
+        "--no-traverse-related",
+        dest="traverse_related",
+        action="store_false",
+        help="Disable auto-jump traversal in seed-video mode.",
+    )
+    parser.add_argument(
+        "--seed-next-mode",
+        choices=("related", "swipe"),
+        default="related",
+        help=(
+            "How to advance to next video in seed-video mode: "
+            "'related' picks one unseen related candidate, "
+            "'swipe' keeps current video and advances by swipe/ArrowDown."
+        ),
+    )
+    parser.add_argument(
+        "--auto-seed-fallback",
+        dest="auto_seed_fallback",
+        action="store_true",
+        help="If first homepage round has zero videos, switch to a seed video URL automatically (default).",
+    )
+    parser.add_argument(
+        "--no-auto-seed-fallback",
+        dest="auto_seed_fallback",
+        action="store_false",
+        help="Disable automatic fallback to seed video URL.",
+    )
+    parser.add_argument(
+        "--seed-aweme-id",
+        default=None,
+        help="Optional seed aweme_id. If set, crawler starts from this seed video.",
+    )
+    parser.add_argument(
+        "--seed-url",
+        default=None,
+        help="Optional seed video URL. If set, crawler starts from this seed video.",
+    )
+    parser.add_argument(
+        "--debug-dump-dir",
+        default=None,
+        help="Optional directory to dump per-round payload diagnostics.",
+    )
+    parser.add_argument(
+        "--stealth",
+        action="store_true",
+        help="Enable basic anti-automation fingerprint masking (default).",
+    )
+    parser.add_argument(
+        "--user-agent",
+        default=DEFAULT_UA,
+        help="Browser user-agent for requests.",
+    )
+    parser.add_argument("--timeout-ms", type=int, default=45000, help="Page timeout in milliseconds.")
+    parser.add_argument("--headless", action="store_true", help="Run browser in headless mode (default).")
+    parser.add_argument("--headful", action="store_true", help="Run browser in headed mode.")
+    parser.set_defaults(headless=True, stealth=True, auto_seed_fallback=True, traverse_related=True)
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.headful:
+        args.headless = False
+    if not args.headless and not os.environ.get("DISPLAY"):
+        raise RuntimeError(
+            "No DISPLAY found. This host has no GUI session for --headful. "
+            "Use default headless mode, or run with xvfb-run."
+        )
+    if args.rounds < 0:
+        raise ValueError("--rounds must be >= 0")
+    if args.videos_per_round <= 0:
+        raise ValueError("--videos-per-round must be > 0")
+    if args.actions_per_round <= 0:
+        raise ValueError("--actions-per-round must be > 0")
+    run_collection(args)
+
+
+if __name__ == "__main__":
+    main()
