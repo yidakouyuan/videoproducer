@@ -40,6 +40,8 @@ tag-matcher
 ```
 
 ## 系统架构
+<img width="1024" height="559" alt="videoagent框架" src="https://github.com/user-attachments/assets/2fd8c86a-822b-4cff-b2c2-afe68cd66dee" />
+
 
 VideoClaw 由三层组成：
 
